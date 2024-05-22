@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..utils import BaseOutput
@@ -181,6 +182,7 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
     @register_to_config
     def __init__(
         self,
+        num_classes: int = 2,
         num_train_timesteps: int = 1000,
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
@@ -188,7 +190,6 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         trained_betas: Optional[Union[np.ndarray, List[float]]] = None,
         variance_type: str = "fixed_small",
         clip_sample: bool = True,
-        prediction_type: str = "epsilon",
         thresholding: bool = False,
         dynamic_thresholding_ratio: float = 0.995,
         clip_sample_range: float = 1.0,
@@ -324,46 +325,6 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
         self.timesteps = torch.from_numpy(timesteps).to(device)
 
-    def _get_variance(self, t, predicted_variance=None, variance_type=None):
-        prev_t = self.previous_timestep(t)
-
-        alpha_prod_t = self.alphas_cumprod[t]
-        alpha_prod_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else self.one
-        current_beta_t = 1 - alpha_prod_t / alpha_prod_t_prev
-
-        # For t > 0, compute predicted variance βt (see formula (6) and (7) from https://arxiv.org/pdf/2006.11239.pdf)
-        # and sample from it to get previous sample
-        # x_{t-1} ~ N(pred_prev_sample, variance) == add variance to pred_sample
-        variance = (1 - alpha_prod_t_prev) / (1 - alpha_prod_t) * current_beta_t
-
-        # we always take the log of variance, so clamp it to ensure it's not 0
-        variance = torch.clamp(variance, min=1e-20)
-
-        if variance_type is None:
-            variance_type = self.config.variance_type
-
-        # hacks - were probably added for training stability
-        if variance_type == "fixed_small":
-            variance = variance
-        # for rl-diffuser https://arxiv.org/abs/2205.09991
-        elif variance_type == "fixed_small_log":
-            variance = torch.log(variance)
-            variance = torch.exp(0.5 * variance)
-        elif variance_type == "fixed_large":
-            variance = current_beta_t
-        elif variance_type == "fixed_large_log":
-            # Glide max_log
-            variance = torch.log(current_beta_t)
-        elif variance_type == "learned":
-            return predicted_variance
-        elif variance_type == "learned_range":
-            min_log = torch.log(variance)
-            max_log = torch.log(current_beta_t)
-            frac = (predicted_variance + 1) / 2
-            variance = frac * max_log + (1 - frac) * min_log
-
-        return variance
-
     def _threshold_sample(self, sample: torch.FloatTensor) -> torch.FloatTensor:
         """
         "Dynamic thresholding: At each sampling step we set s to a certain percentile absolute pixel value in xt0 (the
@@ -399,152 +360,98 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
     def step(
         self,
-        model_output: torch.FloatTensor,
+        model_output: Tensor,
         timestep: int,
-        sample: torch.FloatTensor,
-        generator=None,
-        return_dict: bool = True,
+        sample: Tensor,
+        return_dict: bool = True
     ) -> Union[DiscreteStateSchedulerOutput, Tuple]:
-        """
-        Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
-        process from the learned model outputs (most often the predicted noise).
-
-        Args:
-            model_output (`torch.FloatTensor`):
-                The direct output from learned diffusion model.
-            timestep (`float`):
-                The current discrete timestep in the diffusion chain.
-            sample (`torch.FloatTensor`):
-                A current instance of a sample created by the diffusion process.
-            generator (`torch.Generator`, *optional*):
-                A random number generator.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~schedulers.scheduling_ddpm.DDPMSchedulerOutput`] or `tuple`.
-
-        Returns:
-            [`~schedulers.scheduling_ddpm.DDPMSchedulerOutput`] or `tuple`:
-                If return_dict is `True`, [`~schedulers.scheduling_ddpm.DDPMSchedulerOutput`] is returned, otherwise a
-                tuple is returned where the first element is the sample tensor.
-
-        """
         t = timestep
-
         prev_t = self.previous_timestep(t)
 
-        if model_output.shape[1] == sample.shape[1] * 2 and self.variance_type in ["learned", "learned_range"]:
-            model_output, predicted_variance = torch.split(model_output, sample.shape[1], dim=1)
-        else:
-            predicted_variance = None
-
-        # 1. compute alphas, betas
-        alpha_prod_t = self.alphas_cumprod[t]
-        alpha_prod_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else self.one
-        beta_prod_t = 1 - alpha_prod_t
-        beta_prod_t_prev = 1 - alpha_prod_t_prev
-        current_alpha_t = alpha_prod_t / alpha_prod_t_prev
-        current_beta_t = 1 - current_alpha_t
-
-        K = sample.shape[-1]
-        alpha_t = self.alphas[t]
-        alpha_bar_t_minus_1 = self.alphas_cumprod[prev_t]
-        p_t = (alpha_t * sample + (1 - alpha_t) / K)
-        p_t_minus_1 = (alpha_bar_t_minus_1 * model_output + (1 - alpha_bar_t_minus_1) / K)
-        p = p_t * p_t_minus_1
-
-        # 2. compute predicted original sample from predicted noise also called
-        # "predicted x_0" of formula (15) from https://arxiv.org/pdf/2006.11239.pdf
-        if self.config.prediction_type == "epsilon":
-            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
-        elif self.config.prediction_type == "sample":
-            pred_original_sample = model_output
-        elif self.config.prediction_type == "v_prediction":
-            pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
-        else:
-            raise ValueError(
-                f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample` or"
-                " `v_prediction`  for the DDPMScheduler."
-            )
-
-        # 3. Clip or threshold "predicted x_0"
+        """
         if self.config.thresholding:
             pred_original_sample = self._threshold_sample(pred_original_sample)
         elif self.config.clip_sample:
             pred_original_sample = pred_original_sample.clamp(
                 -self.config.clip_sample_range, self.config.clip_sample_range
             )
+        """
 
-        # 4. Compute coefficients for pred_original_sample x_0 and current sample x_t
-        # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
-        pred_original_sample_coeff = (alpha_prod_t_prev ** (0.5) * current_beta_t) / beta_prod_t
-        current_sample_coeff = current_alpha_t ** (0.5) * beta_prod_t_prev / beta_prod_t
+        alpha_t = self.alphas[t]
+        alpha_cumprod_t_minus_1 = self.alphas_cumprod[t - 1] if t > 0 else 1.0
+        num_classes = self.config.num_classes
 
-        # 5. Compute predicted previous sample µ_t
-        # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
-        pred_prev_sample = pred_original_sample_coeff * pred_original_sample + current_sample_coeff * sample
+        if model_output.size(1) == 1 and num_classes == 2:
+            pred_original_sample = (model_output > 0).to(dtype=model_output.dtype)
+            x_0_one_hot = F.one_hot(pred_original_sample.long().view(model_output.size(0), -1), num_classes).float()
+        else:
+            pred_original_sample = model_output.argmax(dim=1).to(dtype=model_output.dtype)
+            x_0_one_hot = model_output.argmax(dim=1, keepdim=True).float()
 
-        # 6. Add noise
-        variance = 0
-        if t > 0:
-            device = model_output.device
-            variance_noise = randn_tensor(
-                model_output.shape, generator=generator, device=device, dtype=model_output.dtype
-            )
-            if self.variance_type == "fixed_small_log":
-                variance = self._get_variance(t, predicted_variance=predicted_variance) * variance_noise
-            elif self.variance_type == "learned_range":
-                variance = self._get_variance(t, predicted_variance=predicted_variance)
-                variance = torch.exp(0.5 * variance) * variance_noise
-            else:
-                variance = (self._get_variance(t, predicted_variance=predicted_variance) ** 0.5) * variance_noise
+        x_t_one_hot = F.one_hot(sample.long().view(sample.size(0), -1), num_classes).float()
 
-        pred_prev_sample = pred_prev_sample + variance
+        theta_t = alpha_t * x_t_one_hot + (1 - alpha_t) / num_classes
+        theta_t_minus_1 = alpha_cumprod_t_minus_1 * x_0_one_hot + (1 - alpha_cumprod_t_minus_1) / num_classes
+
+        posterior_numerator = theta_t * theta_t_minus_1
+        posterior_denominator = posterior_numerator.sum(dim=-1, keepdim=True)
+
+        p = posterior_numerator / posterior_denominator
+        pred_prev_sample = self.sample(p, noise=t > 0).view_as(sample).to(dtype=sample.dtype)
 
         if not return_dict:
             return (pred_prev_sample,)
 
         return DiscreteStateSchedulerOutput(prev_sample=pred_prev_sample, pred_original_sample=pred_original_sample)
 
-    def add_noise(
-        self,
-        original_samples: torch.FloatTensor,
-        noise: torch.FloatTensor,
-        timesteps: torch.IntTensor,
-    ) -> torch.FloatTensor:
+    def sample(self,
+               probs_or_logits: Tensor,
+               noise: Optional[Union[bool, Tensor]] = None,
+               temperature: float = 1.0,
+               eps: float = 1e-6) -> Tensor:
+        is_logits = torch.any(probs_or_logits < 0) or torch.any(probs_or_logits > 1)
+
+        if noise is None:
+            if is_logits:
+                probs_or_logits = torch.softmax(probs_or_logits, dim=-1)
+            return torch.multinomial(probs_or_logits, 1)
+
+        if not isinstance(noise, Tensor) and noise:
+            noise = torch.rand_like(probs_or_logits)
+
+        gumbel_noise = 0
+        if isinstance(noise, Tensor):
+            gumbel_noise = -torch.log(-torch.log(noise.clip(eps, 1.0)))
+
+        if is_logits:
+            return torch.softmax((probs_or_logits + gumbel_noise) / temperature, dim=-1).argmax(dim=-1)
+
+        logits = torch.log(probs_or_logits.clip(eps, 1.0))
+        return torch.softmax((logits + gumbel_noise) / temperature, dim=-1).argmax(dim=-1)
+
+    def add_noise(self,
+                  original_samples: Tensor,
+                  noise: Tensor,
+                  timesteps: Tensor) -> Tensor:
         self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device)
         alphas_cumprod = self.alphas_cumprod.to(dtype=original_samples.dtype)
         timesteps = timesteps.to(original_samples.device)
+        num_classes = self.config.num_classes
+
+        assert original_samples.min() == 0 and original_samples.max() == num_classes - 1, \
+            f"Original samples must be in the range [0, {num_classes - 1}]"
+
+        if original_samples.size(1) == 1 and num_classes == 2:
+            x_0_one_hot = F.one_hot(original_samples.long().view(original_samples.size(0), -1), num_classes).float()
+        else:
+            x_0_one_hot = original_samples.argmax(dim=1, keepdim=True).float()
 
         alpha_prod = alphas_cumprod[timesteps].flatten()
-        while len(alpha_prod.shape) < len(original_samples.shape):
+        while len(alpha_prod.shape) < len(x_0_one_hot.shape):
             alpha_prod = alpha_prod.unsqueeze(-1)
-        p = alpha_prod * original_samples + (1 - alpha_prod) / original_samples.shape[-1]
 
-        logits = torch.log(p + 1e-6)
-        noise = torch.clip(noise, 1e-6, 1.0)
-        gumbel_noise = -torch.log(-torch.log(noise))
-        noisy_samples = torch.argmax(logits + gumbel_noise, dim=-1)
-        return noisy_samples
-
-    def get_velocity(
-        self, sample: torch.FloatTensor, noise: torch.FloatTensor, timesteps: torch.IntTensor
-    ) -> torch.FloatTensor:
-        # Make sure alphas_cumprod and timestep have same device and dtype as sample
-        self.alphas_cumprod = self.alphas_cumprod.to(device=sample.device)
-        alphas_cumprod = self.alphas_cumprod.to(dtype=sample.dtype)
-        timesteps = timesteps.to(sample.device)
-
-        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
-        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-        while len(sqrt_alpha_prod.shape) < len(sample.shape):
-            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
-
-        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-        while len(sqrt_one_minus_alpha_prod.shape) < len(sample.shape):
-            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
-
-        velocity = sqrt_alpha_prod * noise - sqrt_one_minus_alpha_prod * sample
-        return velocity
+        p = alpha_prod * x_0_one_hot + (1 - alpha_prod) / num_classes
+        return self.sample(p, noise.view_as(x_0_one_hot)).view_as(original_samples).to(dtype=original_samples.dtype)
 
     def __len__(self):
         return self.config.num_train_timesteps
