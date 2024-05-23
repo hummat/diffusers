@@ -383,11 +383,10 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
         if model_output.size(1) == 1 and num_classes == 2:
             pred_original_sample = (model_output > 0).to(dtype=model_output.dtype)
-            x_0_one_hot = F.one_hot(pred_original_sample.long().view(model_output.size(0), -1), num_classes).float()
         else:
             pred_original_sample = model_output.argmax(dim=1).to(dtype=model_output.dtype)
-            x_0_one_hot = model_output.argmax(dim=1, keepdim=True).float()
 
+        x_0_one_hot = F.one_hot(pred_original_sample.long().view(model_output.size(0), -1), num_classes).float()
         x_t_one_hot = F.one_hot(sample.long().view(sample.size(0), -1), num_classes).float()
 
         theta_t = alpha_t * x_t_one_hot + (1 - alpha_t) / num_classes
@@ -428,30 +427,35 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
         logits = torch.log(probs_or_logits.clip(eps, 1.0))
         return torch.softmax((logits + gumbel_noise) / temperature, dim=-1).argmax(dim=-1)
+        # return F.gumbel_softmax(logits).argmax(dim=-1)
 
     def add_noise(self,
                   original_samples: Tensor,
-                  noise: Tensor,
+                  noise: Optional[Tensor],
                   timesteps: Tensor) -> Tensor:
-        self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device)
-        alphas_cumprod = self.alphas_cumprod.to(dtype=original_samples.dtype)
-        timesteps = timesteps.to(original_samples.device)
         num_classes = self.config.num_classes
+        classes = torch.arange(num_classes, device=original_samples.device)
+        unique_vals = torch.unique(original_samples)
 
-        assert original_samples.min() == 0 and original_samples.max() == num_classes - 1, \
-            f"Original samples must be in the range [0, {num_classes - 1}]"
+        assert torch.all(torch.isin(unique_vals, classes)), f"`original_samples` must be in {num_classes}"
+        # assert torch.all(torch.isin(torch.unique(noise), torch.arange(num_classes))), \
+        #     f"`noise` must be in {num_classes}"
+        if noise is not None:
+            assert noise.min().item() >= 0 and noise.max().item() <= 1, "`noise` must be in [0, 1]"
+        # assert original_samples.size() == noise.size(), \
+        #     "`original_samples` and `noise` must have the same shape"
 
-        if original_samples.size(1) == 1 and num_classes == 2:
-            x_0_one_hot = F.one_hot(original_samples.long().view(original_samples.size(0), -1), num_classes).float()
-        else:
-            x_0_one_hot = original_samples.argmax(dim=1, keepdim=True).float()
+        self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device)
+        # alphas_cumprod = self.alphas_cumprod.to(dtype=original_samples.dtype)
+        timesteps = timesteps.to(original_samples.device)
 
-        alpha_prod = alphas_cumprod[timesteps].flatten()
-        while len(alpha_prod.shape) < len(x_0_one_hot.shape):
-            alpha_prod = alpha_prod.unsqueeze(-1)
+        x_0_one_hot = F.one_hot(original_samples.long(), num_classes).float()
+        alpha_prod = self.alphas_cumprod[timesteps].view(-1, *((1,) * (x_0_one_hot.ndim - 1))).float()
 
         p = alpha_prod * x_0_one_hot + (1 - alpha_prod) / num_classes
-        return self.sample(p, noise.view_as(x_0_one_hot)).view_as(original_samples).to(dtype=original_samples.dtype)
+
+        # noise_one_hot = F.one_hot(noise.long(), num_classes).float()
+        return self.sample(p, noise).to(dtype=original_samples.dtype)
 
     def __len__(self):
         return self.config.num_train_timesteps
