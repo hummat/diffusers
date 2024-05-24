@@ -221,6 +221,24 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.log_alphas = torch.log(self.alphas)
+        self.log_alphas_cumprod = torch.cumsum(self.log_alphas, dim=0)
+
+        alpha_mats = []
+        for beta in self.betas:
+            mat = torch.ones(num_classes, num_classes) * beta / num_classes
+            mat.diagonal().fill_(1 - (num_classes - 1) * beta / num_classes)
+            alpha_mats.append(mat)
+        self.alpha_mats = torch.stack(alpha_mats)
+
+        alpha_mat_t = alpha_mats[0]
+        alpha_bar_mats = [alpha_mat_t]
+        for idx in range(1, self.num_train_timesteps):
+            alpha_mat_t = alpha_mat_t @ alpha_mats[idx]
+            alpha_bar_mats.append(alpha_mat_t)
+        self.alpha_bar_mats = torch.stack(alpha_bar_mats)
+
+        self.eps = 1e-6
         self.one = torch.tensor(1.0)
 
         # standard deviation of the initial noise distribution
@@ -325,40 +343,212 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
         self.timesteps = torch.from_numpy(timesteps).to(device)
 
-    def _threshold_sample(self, sample: torch.FloatTensor) -> torch.FloatTensor:
+    def _at(self, a: torch.Tensor, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """
-        "Dynamic thresholding: At each sampling step we set s to a certain percentile absolute pixel value in xt0 (the
-        prediction of x_0 at timestep t), and if s > 1, then we threshold xt0 to the range [-s, s] and then divide by
-        s. Dynamic thresholding pushes saturated pixels (those near -1 and 1) inwards, thereby actively preventing
-        pixels from saturation at each step. We find that dynamic thresholding results in significantly better
-        photorealism as well as better image-text alignment, especially when using very large guidance weights."
+        Extract coefficients at specified timesteps t and conditioning data x.
 
-        https://arxiv.org/abs/2205.11487
+        Args:
+          a: torch.Tensor: 3D tensor of constants indexed by time.
+          t: torch.Tensor: 1D tensor of time indices, shape = (batch_size,).
+          x: torch.Tensor: tensor of shape (batch_size, ...).
+
+        Returns:
+          torch.Tensor: Extracted coefficients.
         """
-        dtype = sample.dtype
-        batch_size, channels, *remaining_dims = sample.shape
+        t_broadcast = t.view(-1, *([1] * (x.ndim - 1)))
+        return a[t_broadcast, x]
 
-        if dtype not in (torch.float32, torch.float64):
-            sample = sample.float()  # upcast for quantile calculation, and clamp not implemented for cpu half
+    def _at_onehot(self, a: torch.Tensor, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract coefficients at specified timesteps t and conditioning data x.
 
-        # Flatten sample for doing quantile calculation along each image
-        sample = sample.reshape(batch_size, channels * np.prod(remaining_dims))
+        Args:
+          a: torch.Tensor: 3D tensor of constants indexed by time.
+          t: torch.Tensor: 1D tensor of time indices, shape = (batch_size,).
+          x: torch.Tensor: tensor of shape (batch_size, ..., num_pixel_vals).
 
-        abs_sample = sample.abs()  # "a certain percentile absolute pixel value"
+        Returns:
+          torch.Tensor: Output of dot(x, a[t], axis=[[-1], [1]]).
+        """
+        a_t = a[t]
+        return torch.matmul(x, a_t)
 
-        s = torch.quantile(abs_sample, self.config.dynamic_thresholding_ratio, dim=1)
-        s = torch.clamp(
-            s, min=1, max=self.config.sample_max_value
-        )  # When clamped to min=1, equivalent to standard clipping to [-1, 1]
-        s = s.unsqueeze(1)  # (batch_size, 1) because clamp will broadcast along dim=0
-        sample = torch.clamp(sample, -s, s) / s  # "we threshold xt0 to the range [-s, s] and then divide by s"
+    def q_posterior_logits(self,
+                           x_start: Tensor,
+                           x_t: Tensor,
+                           t: Tensor,
+                           x_start_logits: bool) -> Tensor:
+        """
+        Compute logits of q(x_{t-1} | x_t, x_start).
 
-        sample = sample.reshape(batch_size, channels, *remaining_dims)
-        sample = sample.to(dtype)
+        Args:
+          x_start: torch.Tensor: The starting data.
+          x_t: torch.Tensor: The data at time t.
+          t: torch.Tensor: Time indices.
+          x_start_logits: bool: Whether x_start is in logits format.
 
-        return sample
+        Returns:
+          torch.Tensor: Logits of q(x_{t-1} | x_t, x_start).
+        """
+        if x_start_logits:
+            assert x_start.shape == x_t.shape + (self.config.num_classes,), (x_start.shape, x_t.shape)
+        else:
+            assert x_start.shape == x_t.shape, (x_start.shape, x_t.shape)
 
-    def step(
+        prev_t = self.previous_timestep(t)  # TODO: Or t - 1?
+
+        fact1 = self._at(self.alpha_mats.transpose(1, 2), t, x_t)
+        if x_start_logits:
+            fact2 = self._at_onehot(self.alpha_bar_mats, prev_t, F.softmax(x_start, dim=-1))
+            tzero_logits = x_start
+        else:
+            fact2 = self._at(self.alpha_bar_mats, prev_t, x_start)
+            tzero_logits = torch.log(F.one_hot(x_start, num_classes=self.config.num_classes).float() + self.eps)
+
+        out = torch.log(fact1 + self.eps) + torch.log(fact2 + self.eps)
+        t_broadcast = t.view(-1, *([1] * (out.ndim - 1)))
+        return torch.where(t_broadcast == 0, tzero_logits, out)
+
+
+    def p_logits(self, x_start: Tensor, t: Tensor, x_t: Tensor) -> Tensor:
+        """
+        Compute logits of p(x_{t-1} | x_t).
+
+        Args:
+          model_fn: Callable that returns the logits for x_start.
+          x: torch.Tensor: The data at time t.
+          t: torch.Tensor: Time indices.
+
+        Returns:
+          torch.Tensor: Logits of p(x_{t-1} | x_t).
+        """
+        t_broadcast = t.view(-1, *([1] * (x_start.ndim - 1)))
+        model_logits = torch.where(
+            t_broadcast == 0,
+            x_start,
+            self.q_posterior_logits(x_start, x_t, t, x_start_logits=True)
+        )
+        return model_logits
+
+    def step(self,
+             model_output: Tensor,
+             timestep: int,
+             sample: Tensor) -> DiscreteStateSchedulerOutput:
+        self.alpha_mats = self.alpha_mats.to(device=model_output.device)
+        self.alpha_bar_mats = self.alpha_bar_mats.to(device=model_output.device)
+
+        probs = torch.sigmoid(model_output)
+        x_0_one_hot = torch.stack([1 - probs, probs], dim=-1)
+        log_x_start = torch.log(x_0_one_hot + self.eps)
+
+        logits = self.p_logits(log_x_start.squeeze(1), timestep, sample.squeeze(1).long()).unsqueeze(1)
+        if timestep > 0:
+            noise = torch.rand_like(logits)
+            gumbel_noise = -torch.log(-torch.log(noise + self.eps) + self.eps)
+            logits += gumbel_noise
+
+        return DiscreteStateSchedulerOutput(prev_sample=logits.argmax(dim=-1).to(sample.dtype),
+                                            pred_original_sample=(model_output > 0).to(model_output.dtype))
+
+    def log_1_min_a(self, a):
+        return torch.log(1 - a.exp() + self.eps)
+
+    @staticmethod
+    def log_add_exp(a, b):
+        maximum = torch.max(a, b)
+        return maximum + torch.log(torch.exp(a - maximum) + torch.exp(b - maximum))
+
+    def index_to_log_onehot(self, x, num_classes):
+        assert x.max().item() < num_classes, \
+            f'Error: {x.max().item()} >= {num_classes}'
+        x_onehot = F.one_hot(x, num_classes)
+
+        permute_order = (0, -1) + tuple(range(1, len(x.size())))
+
+        x_onehot = x_onehot.permute(permute_order)
+
+        log_x = torch.log(x_onehot.float().clamp(min=self.eps))
+
+        return log_x
+
+    def log_sample_categorical(self, logits):
+        uniform = torch.rand_like(logits)
+        gumbel_noise = -torch.log(-torch.log(uniform + self.eps) + self.eps)
+        sample = (gumbel_noise + logits).argmax(dim=1)
+        log_sample = self.index_to_log_onehot(sample, self.config.num_classes)
+        return log_sample
+
+    def q_pred_one_timestep(self, log_x_t, t):
+        # log_alpha_t = extract(self.log_alpha, t, log_x_t.shape)
+        log_alpha_t = self.log_alphas[t].view(-1, *((1,) * (log_x_t.ndim - 1)))
+        # log_1_min_alpha_t = extract(self.log_1_min_alpha, t, log_x_t.shape)
+        log_1_min_alpha_t = self.log_1_min_a(self.log_alphas[t]).view(-1, *((1,) * (log_x_t.ndim - 1)))
+
+        # alpha_t * E[xt] + (1 - alpha_t) 1 / K
+        log_probs = self.log_add_exp(
+            log_x_t + log_alpha_t,
+            log_1_min_alpha_t - np.log(self.config.num_classes)
+        )
+
+        return log_probs
+
+    def q_pred(self, log_x_start, t):
+        # log_cumprod_alpha_t = extract(self.log_cumprod_alpha, t, log_x_start.shape)
+        log_cumprod_alpha_t = self.log_alphas_cumprod[t].view(-1, *((1,) * (log_x_start.ndim - 1)))
+        # log_1_min_cumprod_alpha = extract(self.log_1_min_cumprod_alpha, t, log_x_start.shape)
+        log_1_min_cumprod_alpha = self.log_1_min_a(self.log_alphas_cumprod[t]).view(-1, *((1,) * (log_x_start.ndim - 1)))
+
+        log_probs = self.log_add_exp(
+            log_x_start + log_cumprod_alpha_t,
+            log_1_min_cumprod_alpha - np.log(self.config.num_classes)
+        )
+
+        return log_probs
+
+    def q_posterior(self, log_x_start, log_x_t, t):
+        # q(xt-1 | xt, x0) = q(xt | xt-1, x0) * q(xt-1 | x0) / q(xt | x0)
+        # where q(xt | xt-1, x0) = q(xt | xt-1).
+
+        # t_minus_1 = t - 1
+        t_minus_1 = self.previous_timestep(t)  # TODO: Check if this is correct
+
+        # Remove negative values, will not be used anyway for final decoder
+        t_minus_1 = torch.where(t_minus_1 < 0, torch.zeros_like(t_minus_1), t_minus_1)
+        log_EV_qxtmin_x0 = self.q_pred(log_x_start, t_minus_1)
+
+        num_axes = (1,) * (len(log_x_start.size()) - 1)
+        t_broadcast = t.view(-1, *num_axes) * torch.ones_like(log_x_start)
+        log_EV_qxtmin_x0 = torch.where(t_broadcast == 0, log_x_start, log_EV_qxtmin_x0)
+
+
+        # Note: _NOT_ x_tmin1, which is how the formula is typically used!!!
+        # Not very easy to see why this is true. But it is :)
+        unnormed_logprobs = log_EV_qxtmin_x0 + self.q_pred_one_timestep(log_x_t, t)
+
+        log_EV_xtmin_given_xt_given_xstart = \
+            unnormed_logprobs \
+            - torch.logsumexp(unnormed_logprobs, dim=1, keepdim=True)
+
+        return log_EV_xtmin_given_xt_given_xstart
+
+    def step1(self, model_output, t, sample):
+        self.log_alphas = self.log_alphas.to(device=model_output.device)
+        self.log_alphas_cumprod = self.log_alphas_cumprod.to(device=model_output.device)
+
+        probs = torch.sigmoid(model_output)
+        x_0_one_hot = torch.cat([1 - probs, probs], dim=1)
+        log_x_start = torch.log(x_0_one_hot + self.eps)
+        x_t_one_hot = F.one_hot(sample.long().view(sample.size(0), -1), self.config.num_classes).float().transpose(1, 2)
+        log_x_t= torch.log(x_t_one_hot + self.eps)  # FIXME: Check if this is correct
+
+        out = self.q_posterior(log_x_start=log_x_start, log_x_t=log_x_t, t=t)
+        if t > 0:
+            out = self.log_sample_categorical(out)
+
+        return DiscreteStateSchedulerOutput(prev_sample=out.argmax(dim=1, keepdim=True).to(sample.dtype),
+                                            pred_original_sample=(model_output > 0).to(model_output.dtype))
+
+    def step2(
         self,
         model_output: Tensor,
         timestep: int,
@@ -368,35 +558,32 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         t = timestep
         prev_t = self.previous_timestep(t)
 
-        """
-        if self.config.thresholding:
-            pred_original_sample = self._threshold_sample(pred_original_sample)
-        elif self.config.clip_sample:
-            pred_original_sample = pred_original_sample.clamp(
-                -self.config.clip_sample_range, self.config.clip_sample_range
-            )
-        """
-
-        alpha_t = self.alphas[t]
-        alpha_cumprod_t_minus_1 = self.alphas_cumprod[t - 1] if t > 0 else 1.0
         num_classes = self.config.num_classes
 
         if model_output.size(1) == 1 and num_classes == 2:
             pred_original_sample = (model_output > 0).to(dtype=model_output.dtype)
+            probs = torch.sigmoid(model_output)
+            x_0_one_hot = torch.cat([1 - probs, probs], dim=1)
         else:
             pred_original_sample = model_output.argmax(dim=1).to(dtype=model_output.dtype)
+            x_0_one_hot = torch.softmax(model_output, dim=1)
 
-        x_0_one_hot = F.one_hot(pred_original_sample.long().view(model_output.size(0), -1), num_classes).float()
-        x_t_one_hot = F.one_hot(sample.long().view(sample.size(0), -1), num_classes).float()
+        x_t_one_hot = F.one_hot(sample.long().view(sample.size(0), -1), num_classes).float().transpose(1, 2)
+
+        self.alphas = self.alphas.to(device=model_output.device)
+        self.alphas_cumprod = self.alphas_cumprod.to(device=model_output.device)
+
+        alpha_t = self.alphas[t].view(-1, *((1,) * (x_t_one_hot.ndim - 1)))
+        alpha_cumprod_t_minus_1 = self.alphas_cumprod[prev_t].view(-1, *((1,) * (x_0_one_hot.ndim - 1))) if t > 0 else torch.ones_like(x_0_one_hot)
 
         theta_t = alpha_t * x_t_one_hot + (1 - alpha_t) / num_classes
         theta_t_minus_1 = alpha_cumprod_t_minus_1 * x_0_one_hot + (1 - alpha_cumprod_t_minus_1) / num_classes
 
         posterior_numerator = theta_t * theta_t_minus_1
-        posterior_denominator = posterior_numerator.sum(dim=-1, keepdim=True)
+        posterior_denominator = posterior_numerator.sum(dim=1, keepdim=True)
 
         p = posterior_numerator / posterior_denominator
-        pred_prev_sample = self.sample(p, noise=t > 0).view_as(sample).to(dtype=sample.dtype)
+        pred_prev_sample = self.sample(p, noise=(t > 0).item())
 
         if not return_dict:
             return (pred_prev_sample,)
@@ -406,27 +593,26 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
     def sample(self,
                probs_or_logits: Tensor,
                noise: Optional[Union[bool, Tensor]] = None,
-               temperature: float = 1.0,
-               eps: float = 1e-6) -> Tensor:
-        is_logits = torch.any(probs_or_logits < 0) or torch.any(probs_or_logits > 1)
+               temperature: float = 1.0) -> Tensor:
+        is_logits = torch.any(probs_or_logits < -self.eps) or torch.any(probs_or_logits > 1 + self.eps)
 
         if noise is None:
             if is_logits:
-                probs_or_logits = torch.softmax(probs_or_logits, dim=-1)
+                probs_or_logits = torch.softmax(probs_or_logits, dim=1)
             return torch.multinomial(probs_or_logits, 1)
 
-        if not isinstance(noise, Tensor) and noise:
+        if not torch.is_tensor(noise) and noise:
             noise = torch.rand_like(probs_or_logits)
 
         gumbel_noise = 0
-        if isinstance(noise, Tensor):
-            gumbel_noise = -torch.log(-torch.log(noise.clip(eps, 1.0)))
+        if torch.is_tensor(noise):
+            gumbel_noise = -torch.log(-torch.log(noise + self.eps) + self.eps)
 
         if is_logits:
-            return torch.softmax((probs_or_logits + gumbel_noise) / temperature, dim=-1).argmax(dim=-1)
+            return (probs_or_logits + gumbel_noise).argmax(dim=1, keepdim=True).to(dtype=probs_or_logits.dtype)
 
-        logits = torch.log(probs_or_logits.clip(eps, 1.0))
-        return torch.softmax((logits + gumbel_noise) / temperature, dim=-1).argmax(dim=-1)
+        logits = torch.log(probs_or_logits + self.eps)
+        return (logits + gumbel_noise).argmax(dim=1, keepdim=True).to(dtype=probs_or_logits.dtype)
         # return F.gumbel_softmax(logits).argmax(dim=-1)
 
     def add_noise(self,
@@ -449,7 +635,7 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         # alphas_cumprod = self.alphas_cumprod.to(dtype=original_samples.dtype)
         timesteps = timesteps.to(original_samples.device)
 
-        x_0_one_hot = F.one_hot(original_samples.long(), num_classes).float()
+        x_0_one_hot = F.one_hot(original_samples.long().view(original_samples.size(0), -1), num_classes).float().transpose(1, 2)
         alpha_prod = self.alphas_cumprod[timesteps].view(-1, *((1,) * (x_0_one_hot.ndim - 1))).float()
 
         p = alpha_prod * x_0_one_hot + (1 - alpha_prod) / num_classes
