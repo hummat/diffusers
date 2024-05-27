@@ -43,14 +43,14 @@ class DiscreteStateSchedulerOutput(BaseOutput):
             `pred_original_sample` can be used to preview progress or for guidance.
     """
 
-    prev_sample: torch.FloatTensor
-    pred_original_sample: Optional[torch.FloatTensor] = None
+    prev_sample: Tensor
+    pred_original_sample: Optional[Tensor] = None
 
 
 def betas_for_alpha_bar(
-    num_diffusion_timesteps,
-    max_beta=0.999,
-    alpha_transform_type="cosine",
+        num_diffusion_timesteps,
+        max_beta=0.999,
+        alpha_transform_type="cosine",
 ):
     """
     Create a beta schedule that discretizes the given alpha_t_bar function, which defines the cumulative product of
@@ -120,7 +120,7 @@ def rescale_zero_terminal_snr(betas):
     alphas_bar_sqrt *= alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
 
     # Convert alphas_bar_sqrt to betas
-    alphas_bar = alphas_bar_sqrt**2  # Revert sqrt
+    alphas_bar = alphas_bar_sqrt ** 2  # Revert sqrt
     alphas = alphas_bar[1:] / alphas_bar[:-1]  # Revert cumprod
     alphas = torch.cat([alphas_bar[0:1], alphas])
     betas = 1 - alphas
@@ -181,22 +181,23 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
     @register_to_config
     def __init__(
-        self,
-        num_classes: int = 2,
-        num_train_timesteps: int = 1000,
-        beta_start: float = 0.0001,
-        beta_end: float = 0.02,
-        beta_schedule: str = "linear",
-        trained_betas: Optional[Union[np.ndarray, List[float]]] = None,
-        variance_type: str = "fixed_small",
-        clip_sample: bool = True,
-        thresholding: bool = False,
-        dynamic_thresholding_ratio: float = 0.995,
-        clip_sample_range: float = 1.0,
-        sample_max_value: float = 1.0,
-        timestep_spacing: str = "leading",
-        steps_offset: int = 0,
-        rescale_betas_zero_snr: int = False,
+            self,
+            num_classes: int = 2,
+            num_train_timesteps: int = 1000,
+            beta_start: float = 0.0001,
+            beta_end: float = 0.02,
+            beta_schedule: str = "squaredcos_cap_v2",
+            trained_betas: Optional[Union[np.ndarray, List[float]]] = None,
+            variance_type: str = "fixed_small",
+            clip_sample: bool = True,
+            thresholding: bool = False,
+            dynamic_thresholding_ratio: float = 0.995,
+            clip_sample_range: float = 1.0,
+            sample_max_value: float = 1.0,
+            timestep_spacing: str = "leading",
+            steps_offset: int = 0,
+            rescale_betas_zero_snr: int = False,
+            implementation: str = "simple"
     ):
         if trained_betas is not None:
             self.betas = torch.tensor(trained_betas, dtype=torch.float32)
@@ -204,7 +205,8 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
             self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
             # this schedule is very specific to the latent diffusion model.
-            self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
+            self.betas = torch.linspace(beta_start ** 0.5, beta_end ** 0.5, num_train_timesteps,
+                                        dtype=torch.float32) ** 2
         elif beta_schedule == "squaredcos_cap_v2":
             # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
@@ -238,7 +240,6 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
             alpha_bar_mats.append(alpha_mat_t)
         self.alpha_bar_mats = torch.stack(alpha_bar_mats)
 
-        self.eps = 1e-6
         self.one = torch.tensor(1.0)
 
         # standard deviation of the initial noise distribution
@@ -269,10 +270,10 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         return sample
 
     def set_timesteps(
-        self,
-        num_inference_steps: Optional[int] = None,
-        device: Union[str, torch.device] = None,
-        timesteps: Optional[List[int]] = None,
+            self,
+            num_inference_steps: Optional[int] = None,
+            device: Union[str, torch.device] = None,
+            timesteps: Optional[List[int]] = None,
     ):
         """
         Sets the discrete timesteps used for the diffusion chain (to be run before inference).
@@ -403,12 +404,11 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
             tzero_logits = x_start
         else:
             fact2 = self._at(self.alpha_bar_mats, prev_t, x_start)
-            tzero_logits = torch.log(F.one_hot(x_start, num_classes=self.config.num_classes).float() + self.eps)
+            tzero_logits = torch.log(F.one_hot(x_start, num_classes=self.config.num_classes).float().clamp(min=self.eps))
 
-        out = torch.log(fact1 + self.eps) + torch.log(fact2 + self.eps)
+        out = torch.log(fact1.clamp(min=self.eps)) + torch.log(fact2.clamp(min=self.eps))
         t_broadcast = t.view(-1, *([1] * (out.ndim - 1)))
         return torch.where(t_broadcast == 0, tzero_logits, out)
-
 
     def p_logits(self, x_start: Tensor, t: Tensor, x_t: Tensor) -> Tensor:
         """
@@ -430,218 +430,266 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         )
         return model_logits
 
-    def step(self,
-             model_output: Tensor,
-             timestep: int,
-             sample: Tensor) -> DiscreteStateSchedulerOutput:
+    def step3(self,
+              model_output: Tensor,
+              timestep: int,
+              sample: Tensor) -> DiscreteStateSchedulerOutput:
         self.alpha_mats = self.alpha_mats.to(device=model_output.device)
         self.alpha_bar_mats = self.alpha_bar_mats.to(device=model_output.device)
 
         probs = torch.sigmoid(model_output)
-        x_0_one_hot = torch.stack([1 - probs, probs], dim=-1)
-        log_x_start = torch.log(x_0_one_hot + self.eps)
+        x_start = torch.stack([1 - probs, probs], dim=-1)
+        log_x_start = torch.log(x_start.clamp(min=self.eps))
 
         logits = self.p_logits(log_x_start.squeeze(1), timestep, sample.squeeze(1).long()).unsqueeze(1)
         if timestep > 0:
             noise = torch.rand_like(logits)
-            gumbel_noise = -torch.log(-torch.log(noise + self.eps) + self.eps)
+            gumbel_noise = -torch.log(-torch.log(noise.clamp(min=self.eps)).clamp(min=self.eps))
             logits += gumbel_noise
 
         return DiscreteStateSchedulerOutput(prev_sample=logits.argmax(dim=-1).to(sample.dtype),
                                             pred_original_sample=(model_output > 0).to(model_output.dtype))
 
-    def log_1_min_a(self, a):
-        return torch.log(1 - a.exp() + self.eps)
+    @staticmethod
+    def sample(probs_or_logits: Tensor,
+               noise: Optional[Union[bool, Tensor]] = None,
+               temperature: float = 1.0) -> Tensor:
+        eps = torch.finfo(probs_or_logits.dtype).eps
+        is_logits = torch.any(probs_or_logits < -eps) or torch.any(probs_or_logits > 1 + eps)
+
+        if noise is None:
+            if temperature != 1.0:
+                logits = probs_or_logits
+                if not is_logits:
+                    logits = torch.log(probs_or_logits.clamp(min=eps))
+                sample = F.gumbel_softmax(logits, tau=temperature, hard=False, eps=eps, dim=-1)
+                return sample.argmax(dim=-1).to(dtype=probs_or_logits.dtype)
+
+            probs = probs_or_logits
+            if is_logits:
+                probs = torch.softmax(probs_or_logits, dim=-1)
+            flat_probs = probs.view(-1, probs.size(-1))
+            if probs.size(-1) == 2:
+                return torch.bernoulli(flat_probs[..., 1]).view(probs.size(0), -1)
+            return torch.multinomial(flat_probs, 1).view(probs.size(0), -1)
+
+        if not torch.is_tensor(noise) and noise:
+            noise = torch.rand_like(probs_or_logits)
+
+        gumbel_noise = 0
+        if torch.is_tensor(noise) and not torch.all(noise == 0):
+            gumbel_noise = -torch.log(-torch.log(noise + eps) + eps)
+
+        if is_logits:
+            log_probs = torch.log_softmax(probs_or_logits, dim=-1)
+            perturbed_logits = (log_probs + gumbel_noise) / temperature
+            return perturbed_logits.argmax(dim=-1).to(dtype=probs_or_logits.dtype)
+
+        log_probs = torch.log(probs_or_logits.clamp(min=eps))
+        perturbed_logits = (log_probs + gumbel_noise) / temperature
+        return perturbed_logits.argmax(dim=-1).to(dtype=probs_or_logits.dtype)
+
+    @staticmethod
+    def log1mexp(a: Tensor) -> Tensor:
+        return torch.log(1 - a.exp() + torch.finfo(a.dtype).eps)
 
     @staticmethod
     def log_add_exp(a, b):
         maximum = torch.max(a, b)
         return maximum + torch.log(torch.exp(a - maximum) + torch.exp(b - maximum))
 
-    def index_to_log_onehot(self, x, num_classes):
-        assert x.max().item() < num_classes, \
-            f'Error: {x.max().item()} >= {num_classes}'
-        x_onehot = F.one_hot(x, num_classes)
-
-        permute_order = (0, -1) + tuple(range(1, len(x.size())))
-
-        x_onehot = x_onehot.permute(permute_order)
-
-        log_x = torch.log(x_onehot.float().clamp(min=self.eps))
-
-        return log_x
-
-    def log_sample_categorical(self, logits):
-        uniform = torch.rand_like(logits)
-        gumbel_noise = -torch.log(-torch.log(uniform + self.eps) + self.eps)
-        sample = (gumbel_noise + logits).argmax(dim=1)
-        log_sample = self.index_to_log_onehot(sample, self.config.num_classes)
-        return log_sample
-
-    def q_pred_one_timestep(self, log_x_t, t):
-        # log_alpha_t = extract(self.log_alpha, t, log_x_t.shape)
-        log_alpha_t = self.log_alphas[t].view(-1, *((1,) * (log_x_t.ndim - 1)))
-        # log_1_min_alpha_t = extract(self.log_1_min_alpha, t, log_x_t.shape)
-        log_1_min_alpha_t = self.log_1_min_a(self.log_alphas[t]).view(-1, *((1,) * (log_x_t.ndim - 1)))
-
-        # alpha_t * E[xt] + (1 - alpha_t) 1 / K
-        log_probs = self.log_add_exp(
-            log_x_t + log_alpha_t,
-            log_1_min_alpha_t - np.log(self.config.num_classes)
-        )
-
-        return log_probs
-
-    def q_pred(self, log_x_start, t):
-        # log_cumprod_alpha_t = extract(self.log_cumprod_alpha, t, log_x_start.shape)
-        log_cumprod_alpha_t = self.log_alphas_cumprod[t].view(-1, *((1,) * (log_x_start.ndim - 1)))
-        # log_1_min_cumprod_alpha = extract(self.log_1_min_cumprod_alpha, t, log_x_start.shape)
-        log_1_min_cumprod_alpha = self.log_1_min_a(self.log_alphas_cumprod[t]).view(-1, *((1,) * (log_x_start.ndim - 1)))
-
-        log_probs = self.log_add_exp(
-            log_x_start + log_cumprod_alpha_t,
-            log_1_min_cumprod_alpha - np.log(self.config.num_classes)
-        )
-
-        return log_probs
-
-    def q_posterior(self, log_x_start, log_x_t, t):
-        # q(xt-1 | xt, x0) = q(xt | xt-1, x0) * q(xt-1 | x0) / q(xt | x0)
-        # where q(xt | xt-1, x0) = q(xt | xt-1).
-
-        # t_minus_1 = t - 1
-        t_minus_1 = self.previous_timestep(t)  # TODO: Check if this is correct
-
-        # Remove negative values, will not be used anyway for final decoder
-        t_minus_1 = torch.where(t_minus_1 < 0, torch.zeros_like(t_minus_1), t_minus_1)
-        log_EV_qxtmin_x0 = self.q_pred(log_x_start, t_minus_1)
-
-        num_axes = (1,) * (len(log_x_start.size()) - 1)
-        t_broadcast = t.view(-1, *num_axes) * torch.ones_like(log_x_start)
-        log_EV_qxtmin_x0 = torch.where(t_broadcast == 0, log_x_start, log_EV_qxtmin_x0)
-
-
-        # Note: _NOT_ x_tmin1, which is how the formula is typically used!!!
-        # Not very easy to see why this is true. But it is :)
-        unnormed_logprobs = log_EV_qxtmin_x0 + self.q_pred_one_timestep(log_x_t, t)
-
-        log_EV_xtmin_given_xt_given_xstart = \
-            unnormed_logprobs \
-            - torch.logsumexp(unnormed_logprobs, dim=1, keepdim=True)
-
-        return log_EV_xtmin_given_xt_given_xstart
-
-    def step1(self, model_output, t, sample):
-        self.log_alphas = self.log_alphas.to(device=model_output.device)
-        self.log_alphas_cumprod = self.log_alphas_cumprod.to(device=model_output.device)
-
-        probs = torch.sigmoid(model_output)
-        x_0_one_hot = torch.cat([1 - probs, probs], dim=1)
-        log_x_start = torch.log(x_0_one_hot + self.eps)
-        x_t_one_hot = F.one_hot(sample.long().view(sample.size(0), -1), self.config.num_classes).float().transpose(1, 2)
-        log_x_t= torch.log(x_t_one_hot + self.eps)  # FIXME: Check if this is correct
-
-        out = self.q_posterior(log_x_start=log_x_start, log_x_t=log_x_t, t=t)
-        if t > 0:
-            out = self.log_sample_categorical(out)
-
-        return DiscreteStateSchedulerOutput(prev_sample=out.argmax(dim=1, keepdim=True).to(sample.dtype),
-                                            pred_original_sample=(model_output > 0).to(model_output.dtype))
-
-    def step2(
-        self,
-        model_output: Tensor,
-        timestep: int,
-        sample: Tensor,
-        return_dict: bool = True
-    ) -> Union[DiscreteStateSchedulerOutput, Tuple]:
-        t = timestep
-        prev_t = self.previous_timestep(t)
-
+    def _prepare_step(self,
+                      model_output: Tensor,
+                      sample: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         num_classes = self.config.num_classes
 
-        if model_output.size(1) == 1 and num_classes == 2:
+        if num_classes == 2:
             pred_original_sample = (model_output > 0).to(dtype=model_output.dtype)
             probs = torch.sigmoid(model_output)
-            x_0_one_hot = torch.cat([1 - probs, probs], dim=1)
+            x_start = torch.stack((1 - probs, probs), dim=-1)
         else:
             pred_original_sample = model_output.argmax(dim=1).to(dtype=model_output.dtype)
-            x_0_one_hot = torch.softmax(model_output, dim=1)
+            x_start = torch.softmax(model_output, dim=1).unsqueeze(-1).transpose(1, -1)
 
-        x_t_one_hot = F.one_hot(sample.long().view(sample.size(0), -1), num_classes).float().transpose(1, 2)
+        x_t_one_hot = F.one_hot(sample.long(), num_classes).float()
+
+        assert x_start.shape == x_t_one_hot.shape, (x_start.shape, x_t_one_hot.shape)
+
+        return x_start, x_t_one_hot, pred_original_sample
+
+    def _step_simple(self,
+                     model_output: Tensor,
+                     timestep: Tensor,
+                     sample: Tensor,
+                     return_dict: bool = True) -> Union[DiscreteStateSchedulerOutput, Tuple]:
+        num_classes = self.config.num_classes
+        t = timestep.to(device=model_output.device)
+        # prev_t = self.previous_timestep(t).to(device=model_output.device)
+        prev_t = t - 1
+        prev_t[prev_t < 0] = 0
+
+        x_start, x_t_one_hot, pred_original_sample = self._prepare_step(model_output, sample)
+        t_view = t.view(-1, *((1,) * (x_start.ndim - 1)))
 
         self.alphas = self.alphas.to(device=model_output.device)
         self.alphas_cumprod = self.alphas_cumprod.to(device=model_output.device)
 
         alpha_t = self.alphas[t].view(-1, *((1,) * (x_t_one_hot.ndim - 1)))
-        alpha_cumprod_t_minus_1 = self.alphas_cumprod[prev_t].view(-1, *((1,) * (x_0_one_hot.ndim - 1))) if t > 0 else torch.ones_like(x_0_one_hot)
+        prev_alpha_prod = self.alphas_cumprod[prev_t].view(-1, *((1,) * (x_start.ndim - 1)))
 
         theta_t = alpha_t * x_t_one_hot + (1 - alpha_t) / num_classes
-        theta_t_minus_1 = alpha_cumprod_t_minus_1 * x_0_one_hot + (1 - alpha_cumprod_t_minus_1) / num_classes
+        theta_t_minus_1 = prev_alpha_prod * x_start + (1 - prev_alpha_prod) / num_classes
+        theta_t_minus_1 = torch.where(t_view == 0, x_start, theta_t_minus_1)
 
         posterior_numerator = theta_t * theta_t_minus_1
-        posterior_denominator = posterior_numerator.sum(dim=1, keepdim=True)
+        posterior_denominator = posterior_numerator.sum(dim=-1, keepdim=True)
 
-        p = posterior_numerator / posterior_denominator
-        pred_prev_sample = self.sample(p, noise=(t > 0).item())
+        probs = posterior_numerator / posterior_denominator
+
+        noise = torch.rand_like(probs)
+        noise = torch.where(t_view == 0, torch.zeros_like(noise), noise)
+
+        pred_prev_sample = self.sample(probs, noise)
 
         if not return_dict:
             return (pred_prev_sample,)
 
         return DiscreteStateSchedulerOutput(prev_sample=pred_prev_sample, pred_original_sample=pred_original_sample)
 
-    def sample(self,
-               probs_or_logits: Tensor,
-               noise: Optional[Union[bool, Tensor]] = None,
-               temperature: float = 1.0) -> Tensor:
-        is_logits = torch.any(probs_or_logits < -self.eps) or torch.any(probs_or_logits > 1 + self.eps)
+    def _step_log(self,
+                  model_output: Tensor,
+                  timestep: Tensor,
+                  sample: Tensor,
+                  return_dict: bool = True) -> Union[DiscreteStateSchedulerOutput, Tuple]:
+        num_classes = self.config.num_classes
+        t = timestep.to(device=model_output.device)
+        prev_t = self.previous_timestep(t).to(device=model_output.device)
+        prev_t[prev_t < 0] = 0
 
-        if noise is None:
-            if is_logits:
-                probs_or_logits = torch.softmax(probs_or_logits, dim=1)
-            return torch.multinomial(probs_or_logits, 1)
+        x_start, x_t_one_hot, pred_original_sample = self._prepare_step(model_output, sample)
+        t_view = t.view(-1, *((1,) * (x_start.ndim - 1)))
 
-        if not torch.is_tensor(noise) and noise:
-            noise = torch.rand_like(probs_or_logits)
+        log_x_t = torch.log(x_t_one_hot.clamp(min=torch.finfo(x_t_one_hot.dtype).eps))  # FIXME: Check if this is correct
+        # log_x_t = x_t_one_hot
+        self.log_alphas = self.log_alphas.to(device=model_output.device)
+        log_alpha_t = self.log_alphas[t].view(-1, *((1,) * (log_x_t.ndim - 1)))
+        log_1_min_alpha_t = self.log1mexp(log_alpha_t)
 
-        gumbel_noise = 0
-        if torch.is_tensor(noise):
-            gumbel_noise = -torch.log(-torch.log(noise + self.eps) + self.eps)
+        log_probs1 = self.log_add_exp(log_x_t + log_alpha_t,
+                                      log_1_min_alpha_t - np.log(num_classes))
 
-        if is_logits:
-            return (probs_or_logits + gumbel_noise).argmax(dim=1, keepdim=True).to(dtype=probs_or_logits.dtype)
+        log_x_start = torch.log(x_start.clamp(min=torch.finfo(x_start.dtype).eps))
+        self.log_alphas_cumprod = self.log_alphas_cumprod.to(device=model_output.device)
+        log_alpha_prod = self.log_alphas_cumprod[prev_t].view(-1, *((1,) * (log_x_start.ndim - 1)))
+        log_1_min_alpha_prod = self.log1mexp(log_alpha_prod)
 
-        logits = torch.log(probs_or_logits + self.eps)
-        return (logits + gumbel_noise).argmax(dim=1, keepdim=True).to(dtype=probs_or_logits.dtype)
-        # return F.gumbel_softmax(logits).argmax(dim=-1)
+        log_probs2 = self.log_add_exp(log_x_start + log_alpha_prod,
+                                      log_1_min_alpha_prod - np.log(num_classes))
+        log_probs2 = torch.where(t_view == 0, log_x_start, log_probs2)
+
+        logits = log_probs1 + log_probs2
+        log_probs = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+
+        noise = torch.rand_like(log_probs)
+        noise = torch.where(t_view == 0, torch.zeros_like(noise), noise)
+
+        pred_prev_sample = self.sample(log_probs, noise)
+
+        if not return_dict:
+            return (pred_prev_sample,)
+
+        return DiscreteStateSchedulerOutput(prev_sample=pred_prev_sample, pred_original_sample=pred_original_sample)
+
+    def step(self,
+             model_output: Tensor,
+             timestep: Union[int, Tensor],
+             sample: Tensor,
+             return_dict: bool = True,
+             implementation: Optional[str] = None) -> Union[DiscreteStateSchedulerOutput, Tuple]:
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep])
+        if (implementation or self.config.implementation) == "simple":
+            return self._step_simple(model_output, timestep, sample, return_dict)
+        elif (implementation or self.config.implementation) == "log":
+            return self._step_log(model_output, timestep, sample, return_dict)
+        else:
+            raise NotImplementedError(f"Implementation {self.config.implementation} not supported yet")
+
+    def _prepare_add_noise(self,
+                           original_samples: Tensor,
+                           noise: Optional[Tensor]) -> Tensor:
+        num_classes = self.config.num_classes
+        classes = torch.arange(num_classes, device=original_samples.device)
+        unique_vals = torch.unique(original_samples)
+        assert torch.all(torch.isin(unique_vals, classes)), f"`original_samples` must be in {num_classes}"
+
+        x_start = F.one_hot(original_samples.long(), num_classes).float()
+
+        if noise is not None:
+            assert noise.min().item() >= 0 and noise.max().item() <= 1, "`noise` must be in [0, 1]"
+            assert noise.size() == x_start.size(), \
+                f"Expected noise to have shape {(*x_start.size(),)}, got {(*noise.size(),)}"
+
+        return x_start
+
+    def _add_noise_simple(self,
+                          original_samples: Tensor,
+                          noise: Optional[Tensor],
+                          timesteps: Tensor) -> Tensor:
+        x_start = self._prepare_add_noise(original_samples, noise)
+
+        self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device)
+        timesteps = timesteps.to(original_samples.device)
+        alpha_prod = self.alphas_cumprod[timesteps].view(-1, *((1,) * (x_start.ndim - 1)))
+
+        probs = alpha_prod * x_start + (1 - alpha_prod) / self.config.num_classes
+
+        return self.sample(probs, noise).to(dtype=original_samples.dtype)
+
+    def _add_noise_log(self,
+                       original_samples: Tensor,
+                       noise: Optional[Tensor],
+                       timesteps: Tensor) -> Tensor:
+        x_start = self._prepare_add_noise(original_samples, noise)
+        log_x_start = torch.log(x_start.clamp(min=torch.finfo(x_start.dtype).eps))
+
+        self.log_alphas_cumprod = self.log_alphas_cumprod.to(device=original_samples.device)
+        timesteps = timesteps.to(original_samples.device)
+        log_alpha_prod = self.log_alphas_cumprod[timesteps].view(-1, *((1,) * (log_x_start.ndim - 1)))
+        log_1_min_alpha_prod = self.log1mexp(log_alpha_prod)
+
+        log_probs = self.log_add_exp(log_x_start + log_alpha_prod,
+                                     log_1_min_alpha_prod - np.log(self.config.num_classes))
+
+        return self.sample(log_probs, noise).to(dtype=original_samples.dtype)
+
+    def _add_noise_matrix(self,
+                          original_samples: Tensor,
+                          noise: Optional[Tensor],
+                          timesteps: Tensor) -> Tensor:
+        x_start = self._prepare_add_noise(original_samples, noise)
+
+        self.alpha_bar_mats = self.alpha_bar_mats.to(device=original_samples.device)
+        timesteps = timesteps.to(original_samples.device)
+        alpha_bar_t = self.alpha_bar_mats[timesteps]
+
+        probs = torch.bmm(x_start.view(x_start.size(0), -1, x_start.size(-1)), alpha_bar_t).view_as(x_start)
+
+        return self.sample(probs, noise).to(dtype=original_samples.dtype)
 
     def add_noise(self,
                   original_samples: Tensor,
                   noise: Optional[Tensor],
-                  timesteps: Tensor) -> Tensor:
-        num_classes = self.config.num_classes
-        classes = torch.arange(num_classes, device=original_samples.device)
-        unique_vals = torch.unique(original_samples)
-
-        assert torch.all(torch.isin(unique_vals, classes)), f"`original_samples` must be in {num_classes}"
-        # assert torch.all(torch.isin(torch.unique(noise), torch.arange(num_classes))), \
-        #     f"`noise` must be in {num_classes}"
-        if noise is not None:
-            assert noise.min().item() >= 0 and noise.max().item() <= 1, "`noise` must be in [0, 1]"
-        # assert original_samples.size() == noise.size(), \
-        #     "`original_samples` and `noise` must have the same shape"
-
-        self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device)
-        # alphas_cumprod = self.alphas_cumprod.to(dtype=original_samples.dtype)
-        timesteps = timesteps.to(original_samples.device)
-
-        x_0_one_hot = F.one_hot(original_samples.long().view(original_samples.size(0), -1), num_classes).float().transpose(1, 2)
-        alpha_prod = self.alphas_cumprod[timesteps].view(-1, *((1,) * (x_0_one_hot.ndim - 1))).float()
-
-        p = alpha_prod * x_0_one_hot + (1 - alpha_prod) / num_classes
-
-        # noise_one_hot = F.one_hot(noise.long(), num_classes).float()
-        return self.sample(p, noise).to(dtype=original_samples.dtype)
+                  timesteps: Tensor,
+                  implementation: Optional[str] = None) -> Tensor:
+        if (implementation or self.config.implementation) == "simple":
+            return self._add_noise_simple(original_samples, noise, timesteps)
+        elif (implementation or self.config.implementation) == "log":
+            return self._add_noise_log(original_samples, noise, timesteps)
+        elif (implementation or self.config.implementation) == "matrix":
+            return self._add_noise_matrix(original_samples, noise, timesteps)
+        else:
+            raise NotImplementedError(f"Unsupported implementation: {implementation}")
 
     def __len__(self):
         return self.config.num_train_timesteps
