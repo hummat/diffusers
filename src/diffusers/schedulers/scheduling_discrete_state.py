@@ -235,7 +235,7 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
         alpha_mat_t = alpha_mats[0]
         alpha_bar_mats = [alpha_mat_t]
-        for idx in range(1, self.num_train_timesteps):
+        for idx in range(1, self.config.num_train_timesteps):
             alpha_mat_t = alpha_mat_t @ alpha_mats[idx]
             alpha_bar_mats.append(alpha_mat_t)
         self.alpha_bar_mats = torch.stack(alpha_bar_mats)
