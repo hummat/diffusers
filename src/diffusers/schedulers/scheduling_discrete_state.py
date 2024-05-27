@@ -524,8 +524,7 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
                      return_dict: bool = True) -> Union[DiscreteStateSchedulerOutput, Tuple]:
         num_classes = self.config.num_classes
         t = timestep.to(device=model_output.device)
-        # prev_t = self.previous_timestep(t).to(device=model_output.device)
-        prev_t = t - 1
+        prev_t = self.previous_timestep(t).to(device=model_output.device)
         prev_t[prev_t < 0] = 0
 
         x_start, x_t_one_hot, pred_original_sample = self._prepare_step(model_output, sample)
@@ -570,7 +569,6 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         t_view = t.view(-1, *((1,) * (x_start.ndim - 1)))
 
         log_x_t = torch.log(x_t_one_hot.clamp(min=torch.finfo(x_t_one_hot.dtype).eps))  # FIXME: Check if this is correct
-        # log_x_t = x_t_one_hot
         self.log_alphas = self.log_alphas.to(device=model_output.device)
         log_alpha_t = self.log_alphas[t].view(-1, *((1,) * (log_x_t.ndim - 1)))
         log_1_min_alpha_t = self.log1mexp(log_alpha_t)
