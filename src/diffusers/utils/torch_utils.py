@@ -146,3 +146,8 @@ def apply_freeu(
         res_hidden_states = fourier_filter(res_hidden_states, threshold=1, scale=freeu_kwargs["s2"])
 
     return hidden_states, res_hidden_states
+
+
+def unsqueeze_as(tensor: torch.Tensor, other: Union[torch.Tensor, torch.Size, Tuple[int, ...]]) -> torch.Tensor:
+    ndim = other.ndim if torch.is_tensor(other) else len(other)
+    return tensor.view(-1, *([1] * (ndim - 1)))
