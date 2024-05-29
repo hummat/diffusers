@@ -16,7 +16,8 @@
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Literal
+from functools import cached_property
 
 import numpy as np
 import torch
@@ -188,34 +189,42 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
             beta_end: float = 0.02,
             beta_schedule: str = "squaredcos_cap_v2",
             trained_betas: Optional[Union[np.ndarray, List[float]]] = None,
-            variance_type: str = "fixed_small",
-            clip_sample: bool = True,
-            thresholding: bool = False,
-            dynamic_thresholding_ratio: float = 0.995,
-            clip_sample_range: float = 1.0,
-            sample_max_value: float = 1.0,
             timestep_spacing: str = "leading",
             steps_offset: int = 0,
             rescale_betas_zero_snr: int = False,
+            transition_mat_type: Optional[Literal["uniform", "gaussian", "absorbing"]] = None,
+            transition_bands: Optional[int] = None,
             implementation: str = "simple"
     ):
+        self.implementation = implementation
+        if transition_mat_type is not None:
+            self.implementation = "matrix"
+            if transition_mat_type == "uniform":
+                beta_schedule = "squaredcos_cap_v2"
+            elif transition_mat_type == "gaussian":
+                beta_schedule = "linear"
+            elif transition_mat_type == "absorbing":
+                beta_schedule = "jsd"
+
         if trained_betas is not None:
-            self.betas = torch.tensor(trained_betas, dtype=torch.float32)
+            self.betas = torch.tensor(trained_betas, dtype=torch.float64)
         elif beta_schedule == "linear":
-            self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
+            self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float64)
         elif beta_schedule == "scaled_linear":
             # this schedule is very specific to the latent diffusion model.
             self.betas = torch.linspace(beta_start ** 0.5, beta_end ** 0.5, num_train_timesteps,
-                                        dtype=torch.float32) ** 2
+                                        dtype=torch.float64) ** 2
         elif beta_schedule == "squaredcos_cap_v2":
             # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
         elif beta_schedule == "sigmoid":
             # GeoDiff sigmoid schedule
-            betas = torch.linspace(-6, 6, num_train_timesteps)
+            betas = torch.linspace(-6, 6, num_train_timesteps, dtype=torch.float64)
             self.betas = torch.sigmoid(betas) * (beta_end - beta_start) + beta_start
+        elif beta_schedule == "jsd":
+            self.betas = 1. / torch.linspace(num_train_timesteps, 1, num_train_timesteps)
         else:
-            raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
+            raise NotImplementedError(f"{beta_schedule} is not implemented for {self.__class__.__name__}")
 
         # Rescale for zero SNR
         if rescale_betas_zero_snr:
@@ -223,23 +232,6 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-
-        self.log_alphas = torch.log(self.alphas)
-        self.log_alphas_cumprod = torch.cumsum(self.log_alphas, dim=0)
-
-        alpha_mats = []
-        for beta in self.betas:
-            mat = torch.ones(num_classes, num_classes) * beta / num_classes
-            mat.diagonal().fill_(1 - (num_classes - 1) * beta / num_classes)
-            alpha_mats.append(mat)
-        self.alpha_mats = torch.stack(alpha_mats)
-
-        alpha_mat_t = alpha_mats[0]
-        alpha_bar_mats = [alpha_mat_t]
-        for idx in range(1, num_train_timesteps):
-            alpha_mat_t = alpha_mat_t @ alpha_mats[idx]
-            alpha_bar_mats.append(alpha_mat_t)
-        self.alphas_cumprod_mats = torch.stack(alpha_bar_mats)
 
         # standard deviation of the initial noise distribution
         self.init_noise_sigma = 1.0
@@ -249,7 +241,86 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         self.num_inference_steps = None
         self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy())
 
-        self.variance_type = variance_type
+    @cached_property
+    def log_alphas(self) -> Tensor:
+        return torch.log(self.alphas)
+
+    @cached_property
+    def log_alphas_cumprod(self) -> Tensor:
+        return torch.cumsum(self.log_alphas, dim=0)
+
+    @cached_property
+    def alphas_mats(self) -> Tensor:
+        matrix_type = self.config.transition_mat_type
+        if matrix_type is None or matrix_type == 'uniform':
+            return self.uniform_transition_mats()
+        elif matrix_type == 'gaussian':
+            return self.gaussian_transition_mats()
+        elif matrix_type == 'absorbing':
+            return self.absorbing_transition_mats()
+        else:
+            raise ValueError(f"Unsupported transition matrix type: {self.config.transition_mat_type}")
+
+    def uniform_transition_mats(self) -> Tensor:
+        num_classes = self.config.num_classes
+        transition_bands = self.config.transition_bands
+        alpha_mats = []
+        for beta in self.betas:
+            if transition_bands is None:
+                mat = torch.ones(num_classes, num_classes, dtype=torch.float64) * beta / num_classes
+                mat.diagonal().fill_(1 - (num_classes - 1) * beta / num_classes)
+            else:
+                mat = torch.zeros(num_classes, num_classes, dtype=torch.float64)
+                off_diag = torch.full((num_classes - 1,), beta / float(num_classes), dtype=torch.float64)
+                for k in range(1, transition_bands + 1):
+                    mat += torch.diag(off_diag, k=k)
+                    mat += torch.diag(off_diag, k=-k)
+                    off_diag = off_diag[:-1]
+                diag = 1. - mat.sum(1)
+                mat += torch.diag(diag, k=0)
+            alpha_mats.append(mat)
+        return torch.stack(alpha_mats)
+
+    def gaussian_transition_mats(self) -> Tensor:
+        num_classes = self.config.num_classes
+        transition_bands = self.config.transition_bands or num_classes - 1
+        alpha_mats = []
+        for t, beta in enumerate(self.betas.numpy()):
+            mat = np.zeros((num_classes, num_classes), dtype=np.float64)
+            values = np.linspace(0, num_classes - 1, num_classes, endpoint=True, dtype=np.float64)
+            values = values * 2. / (num_classes - 1.)
+            values = values[:transition_bands + 1]
+            values = -values * values / beta
+            values = np.concatenate([values[:0:-1], values], axis=0)
+            values = F.softmax(torch.from_numpy(values), dim=0).numpy()
+            values = values[transition_bands:]
+            for k in range(1, transition_bands + 1):
+                off_diag = np.full((num_classes - k,), values[k], dtype=np.float64)
+                mat += np.diag(off_diag, k=k)
+                mat += np.diag(off_diag, k=-k)
+            diag = 1. - mat.sum(axis=1)
+            mat += np.diag(diag, k=0)
+            alpha_mats.append(mat)
+        return torch.stack([torch.from_numpy(mat) for mat in alpha_mats])
+
+    def absorbing_transition_mats(self) -> Tensor:
+        num_classes = self.config.num_classes
+        alpha_mats = []
+        for beta in self.betas.numpy():
+            diag = np.full((num_classes,), 1. - beta, dtype=np.float64)
+            mat = np.diag(diag, k=0)
+            mat[:, num_classes // 2] += beta
+            alpha_mats.append(mat)
+        return torch.stack([torch.from_numpy(mat) for mat in alpha_mats])
+
+    @cached_property
+    def alphas_cumprod_mats(self) -> Tensor:
+        alpha_mat_t = self.alphas_mats[0]
+        alpha_bar_mats = [alpha_mat_t]
+        for idx in range(1, self.config.num_train_timesteps):
+            alpha_mat_t = alpha_mat_t @ self.alphas_mats[idx]
+            alpha_bar_mats.append(alpha_mat_t)
+        return torch.stack(alpha_bar_mats)
 
     def scale_model_input(self, sample: torch.FloatTensor, timestep: Optional[int] = None) -> torch.FloatTensor:
         """
@@ -415,14 +486,14 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
                      noise: Optional[Tensor] = None,
                      return_dict: bool = True) -> Union[DiscreteStateSchedulerOutput, Tuple]:
         num_classes = self.config.num_classes
-        t = timestep.to(device=model_output.device)
-        prev_t = self.previous_timestep(t).to(device=model_output.device)
+        t = timestep.to(model_output.device)
+        prev_t = self.previous_timestep(t).to(model_output.device)
         prev_t[prev_t < 0] = 0
 
         x_start, x_t_one_hot, pred_original_sample = self._prepare_step(model_output, sample)
 
-        self.alphas = self.alphas.to(device=model_output.device)
-        self.alphas_cumprod = self.alphas_cumprod.to(device=model_output.device)
+        self.alphas = self.alphas.to(model_output.device)
+        self.alphas_cumprod = self.alphas_cumprod.to(model_output.device)
 
         alpha = unsqueeze_as(self.alphas[t], x_t_one_hot)
         prev_alpha_prod = unsqueeze_as(self.alphas_cumprod[prev_t], x_start)
@@ -450,14 +521,14 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
                   noise: Optional[Tensor] = None,
                   return_dict: bool = True) -> Union[DiscreteStateSchedulerOutput, Tuple]:
         num_classes = self.config.num_classes
-        t = timestep.to(device=model_output.device)
-        prev_t = self.previous_timestep(t).to(device=model_output.device)
+        t = timestep.to(model_output.device)
+        prev_t = self.previous_timestep(t).to(model_output.device)
         prev_t[prev_t < 0] = 0
 
         x_start, x_t_one_hot, pred_original_sample = self._prepare_step(model_output, sample)
 
-        self.log_alphas = self.log_alphas.to(device=model_output.device)
-        self.log_alphas_cumprod = self.log_alphas_cumprod.to(device=model_output.device)
+        self.log_alphas = self.log_alphas.to(model_output.device)
+        self.log_alphas_cumprod = self.log_alphas_cumprod.to(model_output.device)
 
         log_x_t = torch.log(x_t_one_hot.clamp(min=torch.finfo(x_t_one_hot.dtype).eps))
         log_alpha_t = unsqueeze_as(self.log_alphas[t], log_x_t)
@@ -488,19 +559,19 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
                      sample: Tensor,
                      noise: Optional[Tensor] = None,
                      return_dict: bool = True) -> Union[DiscreteStateSchedulerOutput, Tuple]:
-        t = timestep.to(device=model_output.device)
-        prev_t = self.previous_timestep(t).to(device=model_output.device)
+        t = timestep.to(model_output.device)
+        prev_t = self.previous_timestep(t).to(model_output.device)
         prev_t[prev_t < 0] = 0
 
         x_start, x_t_one_hot, pred_original_sample = self._prepare_step(model_output, sample)
 
-        self.alpha_mats = self.alpha_mats.to(device=model_output.device)
-        self.alphas_cumprod_mats = self.alphas_cumprod_mats.to(device=model_output.device)
+        self.alpha_mats = self.alphas_mats.to(model_output.device)
+        self.alphas_cumprod_mats = self.alphas_cumprod_mats.to(model_output.device)
 
         probs1 = torch.bmm(x_t_one_hot.view(x_t_one_hot.size(0), -1, x_t_one_hot.size(-1)),
-                           self.alpha_mats[t].transpose(1, 2)).view_as(x_t_one_hot)
+                           self.alphas_mats[t].transpose(1, 2).to(x_t_one_hot.dtype)).view_as(x_t_one_hot)
         probs2 = torch.bmm(x_start.view(x_start.size(0), -1, x_start.size(-1)),
-                           self.alphas_cumprod_mats[prev_t]).view_as(x_start)
+                           self.alphas_cumprod_mats[prev_t].to(x_start.dtype)).view_as(x_start)
 
         probs = probs1 * probs2
         probs = probs / probs.sum(dim=-1, keepdim=True)
@@ -524,11 +595,11 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
              implementation: Optional[str] = None) -> Union[DiscreteStateSchedulerOutput, Tuple]:
         if not torch.is_tensor(timestep):
             timestep = torch.tensor([timestep])
-        if (implementation or self.config.implementation) == "simple":
+        if (implementation or self.implementation) == "simple":
             return self._step_simple(model_output, timestep, sample, noise, return_dict)
-        elif (implementation or self.config.implementation) == "log":
+        elif (implementation or self.implementation) == "log":
             return self._step_log(model_output, timestep, sample, noise, return_dict)
-        elif (implementation or self.config.implementation) == "matrix":
+        elif (implementation or self.implementation) == "matrix":
             return self._step_matrix(model_output, timestep, sample, noise, return_dict)
         else:
             raise NotImplementedError(f"Implementation {self.config.implementation} not supported yet")
@@ -556,7 +627,7 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
                           timesteps: Tensor) -> Tensor:
         x_start = self._prepare_add_noise(original_samples, noise)
 
-        self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device)
+        self.alphas_cumprod = self.alphas_cumprod.to(original_samples.device)
         timesteps = timesteps.to(original_samples.device)
         alpha_prod = unsqueeze_as(self.alphas_cumprod[timesteps], x_start)
 
@@ -571,7 +642,7 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         x_start = self._prepare_add_noise(original_samples, noise)
         log_x_start = torch.log(x_start.clamp(min=torch.finfo(x_start.dtype).eps))
 
-        self.log_alphas_cumprod = self.log_alphas_cumprod.to(device=original_samples.device)
+        self.log_alphas_cumprod = self.log_alphas_cumprod.to(original_samples.device)
         timesteps = timesteps.to(original_samples.device)
         log_alpha_prod = unsqueeze_as(self.log_alphas_cumprod[timesteps], log_x_start)
         log_1_min_alpha_prod = self.log1mexp(log_alpha_prod)
@@ -587,11 +658,12 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
                           timesteps: Tensor) -> Tensor:
         x_start = self._prepare_add_noise(original_samples, noise)
 
-        self.alphas_cumprod_mats = self.alphas_cumprod_mats.to(device=original_samples.device)
+        self.alphas_cumprod_mats = self.alphas_cumprod_mats.to(original_samples.device)
         timesteps = timesteps.to(original_samples.device)
         alpha_prod_mat = self.alphas_cumprod_mats[timesteps]
 
-        probs = torch.bmm(x_start.view(x_start.size(0), -1, x_start.size(-1)), alpha_prod_mat).view_as(x_start)
+        probs = torch.bmm(x_start.view(x_start.size(0), -1, x_start.size(-1)),
+                          alpha_prod_mat.to(x_start.dtype)).view_as(x_start)
 
         return self.sample(probs, noise).to(dtype=original_samples.dtype)
 
@@ -600,11 +672,11 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
                   noise: Optional[Tensor],
                   timesteps: Tensor,
                   implementation: Optional[str] = None) -> Tensor:
-        if (implementation or self.config.implementation) == "simple":
+        if (implementation or self.implementation) == "simple":
             return self._add_noise_simple(original_samples, noise, timesteps)
-        elif (implementation or self.config.implementation) == "log":
+        elif (implementation or self.implementation) == "log":
             return self._add_noise_log(original_samples, noise, timesteps)
-        elif (implementation or self.config.implementation) == "matrix":
+        elif (implementation or self.implementation) == "matrix":
             return self._add_noise_matrix(original_samples, noise, timesteps)
         else:
             raise NotImplementedError(f"Unsupported implementation: {implementation}")

@@ -8,9 +8,10 @@ from .test_schedulers import SchedulerCommonTest
 class DiscreteStateSchedulerTest(SchedulerCommonTest):
 
     def test_add_noise(self):
-        scheduler = DiscreteStateScheduler()
+        scheduler = DiscreteStateScheduler(beta_schedule="linear",
+                                           rescale_betas_zero_snr=True)
 
-        original_samples = torch.randint(0, scheduler.config.num_classes, (10, 1, 16 ** 3))
+        original_samples = torch.randint(0, scheduler.config.num_classes, (10, 1, 32 ** 3))
         noise = torch.rand(*original_samples.shape, scheduler.config.num_classes)
         timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (original_samples.size(0),))
 
@@ -28,7 +29,8 @@ class DiscreteStateSchedulerTest(SchedulerCommonTest):
         assert torch.equal(simple_noisy, matrix_noisy)
 
     def test_step(self):
-        scheduler = DiscreteStateScheduler()
+        scheduler = DiscreteStateScheduler(beta_schedule="linear",
+                                           rescale_betas_zero_snr=True)
 
         model_output = torch.rand(1, 1, 32 ** 3)
         model_output[model_output < 0.5] *= -1
