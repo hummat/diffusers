@@ -203,6 +203,8 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
                 beta_schedule = "squaredcos_cap_v2"
             elif transition_mat_type == "gaussian":
                 beta_schedule = "linear"
+                beta_start = 0.02
+                beta_end  = 1.0
             elif transition_mat_type == "absorbing":
                 beta_schedule = "jsd"
 
@@ -504,6 +506,19 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         probs = probs1 * probs2
         probs = probs / probs.sum(dim=-1, keepdim=True)
 
+        """
+        # Compute predicted epsilon (noise)
+        pred_epsilon = (sample - alpha ** 0.5 * pred_original_sample) / (1 - alpha) ** 0.5
+
+        # Calculate the direction component
+        direction_component = (1 - prev_alpha_prod) ** 0.5 * pred_epsilon
+
+        # Compute previous sample x_{t-1}
+        prev_sample_prob = prev_alpha_prod ** 0.5 * pred_original_sample + direction_component
+        
+        pred_prev_sample = self.sample(prev_sample_prob, noise=True if noise is None else noise)
+        """
+
         pred_prev_sample = self.sample(probs, noise=True if noise is None else noise)
         pred_prev_sample = torch.where(unsqueeze_as(t, pred_prev_sample) == 0,
                                        x_start.argmax(dim=-1).to(dtype=x_start.dtype),
@@ -512,7 +527,8 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         if not return_dict:
             return (pred_prev_sample,)
 
-        return DiscreteStateSchedulerOutput(prev_sample=pred_prev_sample, pred_original_sample=pred_original_sample)
+        return DiscreteStateSchedulerOutput(prev_sample=pred_prev_sample.to(dtype=sample.dtype),
+                                            pred_original_sample=pred_original_sample.to(model_output.dtype))
 
     def _step_log(self,
                   model_output: Tensor,
@@ -551,7 +567,8 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         if not return_dict:
             return (pred_prev_sample,)
 
-        return DiscreteStateSchedulerOutput(prev_sample=pred_prev_sample, pred_original_sample=pred_original_sample)
+        return DiscreteStateSchedulerOutput(prev_sample=pred_prev_sample.to(dtype=sample.dtype),
+                                            pred_original_sample=pred_original_sample.to(model_output.dtype))
 
     def _step_matrix(self,
                      model_output: Tensor,
@@ -584,7 +601,8 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         if not return_dict:
             return (pred_prev_sample,)
 
-        return DiscreteStateSchedulerOutput(prev_sample=pred_prev_sample, pred_original_sample=pred_original_sample)
+        return DiscreteStateSchedulerOutput(prev_sample=pred_prev_sample.to(dtype=sample.dtype),
+                                            pred_original_sample=pred_original_sample.to(model_output.dtype))
 
     def step(self,
              model_output: Tensor,
