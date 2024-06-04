@@ -76,7 +76,7 @@ def betas_for_alpha_bar(
     if alpha_transform_type == "cosine":
 
         def alpha_bar_fn(t):
-            return math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
+            return math.cos((t + 0.008) / 1.008 * math.pi / 2)  # **2 removed by authors
 
     elif alpha_transform_type == "exp":
 
@@ -205,8 +205,6 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
                 beta_schedule = "squaredcos_cap_v2"
             elif transition_mat_type == "gaussian":
                 beta_schedule = "linear"
-                beta_start = 0.02
-                beta_end  = 1.0
             elif transition_mat_type == "absorbing":
                 beta_schedule = "jsd"
 
