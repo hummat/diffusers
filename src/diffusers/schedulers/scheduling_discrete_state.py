@@ -239,6 +239,7 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
         # standard deviation of the initial noise distribution
         self.init_noise_sigma = 1.0
+        self.eps = 1e-6
 
         # setable values
         self.custom_timesteps = False
@@ -418,19 +419,18 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
         self.timesteps = torch.from_numpy(timesteps).to(device)
 
-    @staticmethod
-    def sample(probs_or_logits: Tensor,
+    def sample(self,
+               probs_or_logits: Tensor,
                noise: Optional[Union[bool, Tensor]] = None,
                temperature: float = 1.0) -> Tensor:
-        eps = torch.finfo(probs_or_logits.dtype).eps
-        is_logits = torch.any(probs_or_logits < -eps) or torch.any(probs_or_logits > 1 + eps)
+        is_logits = torch.any(probs_or_logits < -self.eps) or torch.any(probs_or_logits > 1 + self.eps)
 
         if noise is None:
             if temperature != 1.0:
                 logits = probs_or_logits
                 if not is_logits:
-                    logits = torch.log(probs_or_logits.clamp(min=eps))
-                sample = F.gumbel_softmax(logits, tau=temperature, hard=False, eps=eps, dim=-1)
+                    logits = torch.log(probs_or_logits.clamp(min=self.eps))
+                sample = F.gumbel_softmax(logits, tau=temperature, hard=False, eps=self.eps, dim=-1)
                 return sample.argmax(dim=-1).type(probs_or_logits.dtype)
 
             probs = probs_or_logits
@@ -446,20 +446,19 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
         gumbel_noise = 0
         if torch.is_tensor(noise) and not torch.all(noise == 0):
-            gumbel_noise = -torch.log(-torch.log(noise.clip(eps, 1.0)))
+            gumbel_noise = -torch.log(-torch.log(noise.clamp(self.eps, 1.0)))
 
         if is_logits:
             log_probs = torch.log_softmax(probs_or_logits, dim=-1)
             perturbed_logits = (log_probs + gumbel_noise) / temperature
             return perturbed_logits.argmax(dim=-1).type(probs_or_logits.dtype)
 
-        log_probs = torch.log(probs_or_logits.clamp(min=eps))
+        log_probs = torch.log(probs_or_logits.clamp(min=self.eps))
         perturbed_logits = (log_probs + gumbel_noise) / temperature
         return perturbed_logits.argmax(dim=-1).type(probs_or_logits.dtype)
 
-    @staticmethod
-    def log1mexp(a: Tensor) -> Tensor:
-        return torch.log(1 - a.exp() + torch.finfo(a.dtype).eps)
+    def log1mexp(self, a: Tensor) -> Tensor:
+        return torch.log((1 - a.exp()).clamp(min=self.eps))
 
     @staticmethod
     def log_add_exp(a, b):
@@ -476,6 +475,9 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         else:
             pred_original_sample = model_output.argmax(dim=1, keepdim=True).type(model_output.dtype)
             x_start = torch.softmax(model_output, dim=1).unsqueeze(-1).transpose(1, -1)
+
+        if not torch.is_floating_point(model_output):
+            x_start = F.one_hot(model_output.long(), self.config.num_classes).float()
 
         x_t_one_hot = F.one_hot(sample.long(), self.config.num_classes).float()
 
@@ -535,17 +537,18 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         self.log_alphas = self.log_alphas.to(model_output.device)
         self.log_alphas_cumprod = self.log_alphas_cumprod.to(model_output.device)
 
-        log_x_t = torch.log(x_t_one_hot.clamp(min=torch.finfo(x_t_one_hot.dtype).eps))
+        log_x_t = torch.log(x_t_one_hot.clamp(min=self.eps))
         log_alpha_t = unsqueeze_as(self.log_alphas[t], log_x_t)
         log_1_min_alpha_t = self.log1mexp(log_alpha_t)
         logits1 = self.log_add_exp(log_x_t + log_alpha_t, log_1_min_alpha_t - np.log(num_classes))
 
-        log_x_start = torch.log(x_start.clamp(min=torch.finfo(x_start.dtype).eps))
+        log_x_start = torch.log(x_start.clamp(min=self.eps))
         log_alpha_prod = unsqueeze_as(self.log_alphas_cumprod[prev_t], log_x_start)
         log_1_min_alpha_prod = self.log1mexp(log_alpha_prod)
         logits2 = self.log_add_exp(log_x_start + log_alpha_prod, log_1_min_alpha_prod - np.log(num_classes))
 
         logits = logits1 + logits2
+        logits = torch.where(unsqueeze_as(t, logits) == 0, log_x_start, logits)
         log_probs = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
 
         pred_prev_sample = self.sample(log_probs, noise=True if noise is None else noise)
@@ -649,7 +652,7 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
                        noise: Optional[Tensor],
                        timesteps: Tensor) -> Tuple[Tensor, Tensor]:
         x_start = self._prepare_add_noise(original_samples, noise)
-        log_x_start = torch.log(x_start.clamp(min=torch.finfo(x_start.dtype).eps))
+        log_x_start = torch.log(x_start.clamp(min=self.eps))
 
         self.log_alphas_cumprod = self.log_alphas_cumprod.to(original_samples.device)
         timesteps = timesteps.to(original_samples.device)
