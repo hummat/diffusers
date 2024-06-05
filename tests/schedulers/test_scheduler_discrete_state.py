@@ -8,8 +8,7 @@ from .test_schedulers import SchedulerCommonTest
 class DiscreteStateSchedulerTest(SchedulerCommonTest):
 
     def test_add_noise(self):
-        scheduler = DiscreteStateScheduler(beta_schedule="linear",
-                                           rescale_betas_zero_snr=True)
+        scheduler = DiscreteStateScheduler()
 
         original_samples = torch.randint(0, scheduler.config.num_classes, (10, 1, 32 ** 3))
         noise = torch.rand(*original_samples.shape, scheduler.config.num_classes)
@@ -29,14 +28,13 @@ class DiscreteStateSchedulerTest(SchedulerCommonTest):
         assert torch.equal(simple_noisy, matrix_noisy)
 
     def test_step(self):
-        scheduler = DiscreteStateScheduler(beta_schedule="linear",
-                                           rescale_betas_zero_snr=True)
+        scheduler = DiscreteStateScheduler()
 
         model_output = torch.rand(1, 1, 32 ** 3)
         model_output[model_output < 0.5] *= -1
         sample = torch.randint_like(model_output, 0, scheduler.config.num_classes)
 
-        for t in reversed([0, 1, 2, 10, 100, 500, 999]):
+        for t in reversed([0, 1, 2, 10, 100, 200, 300, 500, 750, 999]):
             model_output = torch.rand(1, 1, 32 ** 3)
             model_output[model_output < 0.5] *= -1
             noise = torch.rand(*sample.shape, scheduler.config.num_classes)
@@ -46,6 +44,7 @@ class DiscreteStateSchedulerTest(SchedulerCommonTest):
             assert torch.any(out_simple.prev_sample != 0)
             if t == 0:
                 assert torch.equal(out_simple.prev_sample, out_simple.pred_original_sample)
+                assert torch.equal(out_simple.prev_log_probs, out_simple.pred_original_log_probs)
             elif t > 10:
                 assert not torch.equal(out_simple.prev_sample, sample)
             assert out_simple.pred_original_sample.size() == model_output.size()
@@ -54,9 +53,13 @@ class DiscreteStateSchedulerTest(SchedulerCommonTest):
             out_log = scheduler.step(model_output, t, sample, noise, implementation="log")
             assert torch.equal(out_simple.prev_sample, out_log.prev_sample)
             assert torch.equal(out_simple.pred_original_sample, out_log.pred_original_sample)
+            assert torch.allclose(out_simple.prev_log_probs, out_log.prev_log_probs, atol=1e-1)
+            assert torch.equal(out_simple.pred_original_log_probs, out_log.pred_original_log_probs)
 
             out_matrix = scheduler.step(model_output, t, sample, noise, implementation="matrix")
             assert torch.equal(out_simple.prev_sample, out_matrix.prev_sample)
             assert torch.equal(out_simple.pred_original_sample, out_matrix.pred_original_sample)
+            assert torch.allclose(out_simple.prev_log_probs, out_matrix.prev_log_probs, atol=1e-1)
+            assert torch.equal(out_simple.pred_original_log_probs, out_matrix.pred_original_log_probs)
 
             sample = out_simple.prev_sample

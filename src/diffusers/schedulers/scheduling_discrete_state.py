@@ -46,8 +46,8 @@ class DiscreteStateSchedulerOutput(BaseOutput):
 
     prev_sample: Tensor
     pred_original_sample: Optional[Tensor] = None
-    prev_logits: Optional[Tensor] = None
-    pred_original_logits: Optional[Tensor] = None
+    prev_log_probs: Optional[Tensor] = None
+    pred_original_log_probs: Optional[Tensor] = None
 
 
 def betas_for_alpha_bar(
@@ -76,7 +76,7 @@ def betas_for_alpha_bar(
     if alpha_transform_type == "cosine":
 
         def alpha_bar_fn(t):
-            return math.cos((t + 0.008) / 1.008 * math.pi / 2)  # **2 removed by authors
+            return math.cos((t + 0.008) / 1.008 * math.pi / 2)  # Note: square removed from original code
 
     elif alpha_transform_type == "exp":
 
@@ -216,8 +216,7 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
             # this schedule is very specific to the latent diffusion model.
             self.betas = torch.linspace(beta_start ** 0.5, beta_end ** 0.5, num_train_timesteps,
                                         dtype=torch.float64) ** 2
-        elif beta_schedule == "squaredcos_cap_v2":
-            # Glide cosine schedule
+        elif "cos_cap" in beta_schedule:
             self.betas = betas_for_alpha_bar(num_train_timesteps)
         elif beta_schedule == "sigmoid":
             # GeoDiff sigmoid schedule
@@ -507,6 +506,7 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
         probs_prod = probs1 * probs2
         probs = probs_prod / probs_prod.sum(dim=-1, keepdim=True)
+        probs = torch.where(unsqueeze_as(t, probs) == 0, x_start, probs)
 
         pred_prev_sample = self.sample(probs, noise=True if noise is None else noise)
         pred_prev_sample = torch.where(unsqueeze_as(t, pred_prev_sample) == 0,
@@ -517,7 +517,9 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
             return (pred_prev_sample,)
 
         return DiscreteStateSchedulerOutput(prev_sample=pred_prev_sample.type(sample.dtype),
-                                            pred_original_sample=pred_original_sample.to(model_output.dtype))
+                                            pred_original_sample=pred_original_sample.to(model_output.dtype),
+                                            prev_log_probs=torch.log(probs.clamp(min=self.eps)).type(sample.dtype),
+                                            pred_original_log_probs=torch.log(x_start.clamp(min=self.eps)).type(model_output.dtype))
 
     def _step_log(self,
                   model_output: Tensor,
@@ -546,8 +548,8 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
         logits2 = self.log_add_exp(log_x_start + log_alpha_prod, log_1_min_alpha_prod - np.log(num_classes))
 
         logits = logits1 + logits2
-        logits = torch.where(unsqueeze_as(t, logits) == 0, log_x_start, logits)
         log_probs = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+        log_probs = torch.where(unsqueeze_as(t, log_probs) == 0, log_x_start, log_probs)
 
         pred_prev_sample = self.sample(log_probs, noise=True if noise is None else noise)
         pred_prev_sample = torch.where(unsqueeze_as(t, pred_prev_sample) == 0,
@@ -559,8 +561,8 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
         return DiscreteStateSchedulerOutput(prev_sample=pred_prev_sample.type(sample.dtype),
                                             pred_original_sample=pred_original_sample.type(model_output.dtype),
-                                            prev_logits=logits.type(sample.dtype),
-                                            pred_original_logits=log_x_start.type(model_output.dtype))
+                                            prev_log_probs=log_probs.type(sample.dtype),
+                                            pred_original_log_probs=log_x_start.type(model_output.dtype))
 
     def _step_matrix(self,
                      model_output: Tensor,
@@ -584,6 +586,7 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
 
         probs_prod = probs1 * probs2
         probs = probs_prod / probs_prod.sum(dim=-1, keepdim=True)
+        probs = torch.where(unsqueeze_as(t, probs) == 0, x_start, probs)
 
         pred_prev_sample = self.sample(probs, noise=True if noise is None else noise)
         pred_prev_sample = torch.where(unsqueeze_as(t, pred_prev_sample) == 0,
@@ -594,7 +597,9 @@ class DiscreteStateScheduler(SchedulerMixin, ConfigMixin):
             return (pred_prev_sample,)
 
         return DiscreteStateSchedulerOutput(prev_sample=pred_prev_sample.type(sample.dtype),
-                                            pred_original_sample=pred_original_sample.to(model_output.dtype))
+                                            pred_original_sample=pred_original_sample.to(model_output.dtype),
+                                            prev_log_probs=torch.log(probs.clamp(min=self.eps)).type(sample.dtype),
+                                            pred_original_log_probs=torch.log(x_start.clamp(min=self.eps)).type(model_output.dtype))
 
     def step(self,
              model_output: Tensor,
